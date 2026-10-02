@@ -1,0 +1,221 @@
+openapi: 3.0.3
+info:
+  title: Acme Payments API
+  version: 2.1.0
+  description: |
+    Payment authorisation and refund service for the Acme commerce platform.
+    Wraps a single external PSP (Stripe) and keeps card data entirely out of
+    the rest of the platform — callers pass tokenised payment method
+    references only.
+
+    ## Service dependencies
+
+    **This service calls:**
+
+    | Target service | Operation | Purpose |
+    |---|---|---|
+    | Stripe *(external)* | `POST /v1/payment_intents` | Authorise or capture a charge |
+    | Stripe *(external)* | `POST /v1/refunds` | Refund a captured charge |
+    | Stripe *(external)* | `POST /v1/webhook_endpoints` | Register webhook receivers |
+
+    **Services that call this service:**
+
+    - `acme-orders-api` — `POST /v1/charges` (checkout), `POST /v1/charges/{chargeId}/refunds` (cancellation)
+
+    ## Data stores
+
+    - **PostgreSQL** `acme_payments` — tables `charges`, `refunds`, `webhook_events`
+      (PCI scope boundary — no PAN or CVV is persisted)
+
+    ## Notes for dependency analysis
+
+    This is the only service in the platform with an outbound dependency on an
+    external payment processor. Stripe API version pinning is done per-request
+    via the `Stripe-Version` header; bumping it is a platform-wide risk.
+
+    The charge state machine is `pending -> authorised -> captured -> refunded`,
+    with `failed` reachable from `pending` and `authorised`.
+  contact:
+    name: Acme Payments Team
+    email: payments@acme.example
+servers:
+  - url: https://payments.internal.acme.example/v1
+    description: Cluster-internal endpoint (service mesh)
+tags:
+  - name: charges
+    description: Charge authorisation and capture
+  - name: refunds
+    description: Refund operations
+  - name: webhooks
+    description: Stripe webhook receivers
+paths:
+  /charges:
+    post:
+      operationId: createCharge
+      summary: Authorise a payment
+      description: |
+        Creates a Stripe PaymentIntent in manual-capture mode and returns a
+        charge in `authorised` state. Capture happens later via
+        `POST /charges/{chargeId}/capture`.
+      tags: [charges]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChargeRequest'
+      responses:
+        '201':
+          description: Charge authorised
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Charge'
+        '402':
+          description: Card declined by the processor
+        '502':
+          description: Stripe unreachable
+  /charges/{chargeId}:
+    get:
+      operationId: getCharge
+      summary: Fetch a charge
+      tags: [charges]
+      parameters:
+        - $ref: '#/components/parameters/ChargeId'
+      responses:
+        '200':
+          description: The charge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Charge'
+        '404':
+          description: Charge not found
+  /charges/{chargeId}/capture:
+    post:
+      operationId: captureCharge
+      summary: Capture an authorised charge
+      tags: [charges]
+      parameters:
+        - $ref: '#/components/parameters/ChargeId'
+      responses:
+        '200':
+          description: Charge captured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Charge'
+        '409':
+          description: Charge is not in `authorised` state
+  /charges/{chargeId}/refunds:
+    post:
+      operationId: refundCharge
+      summary: Refund a captured charge
+      description: |
+        Issues a full or partial refund. Called by `acme-orders-api` when an
+        order is cancelled after payment capture.
+      tags: [refunds]
+      parameters:
+        - $ref: '#/components/parameters/ChargeId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+      responses:
+        '201':
+          description: Refund created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '409':
+          description: Charge is not refundable
+  /webhooks/stripe:
+    post:
+      operationId: receiveStripeWebhook
+      summary: Receive a Stripe webhook
+      description: |
+        Handles `payment_intent.succeeded`, `payment_intent.payment_failed`,
+        and `charge.refunded`. Signature-verified against the endpoint secret.
+      tags: [webhooks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '204':
+          description: Accepted
+        '400':
+          description: Signature verification failed
+components:
+  parameters:
+    ChargeId:
+      name: chargeId
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    ChargeStatus:
+      type: string
+      enum: [pending, authorised, captured, refunded, failed]
+    CreateChargeRequest:
+      type: object
+      required: [amountCents, currency, paymentMethodId]
+      properties:
+        amountCents:
+          type: integer
+          minimum: 50
+        currency:
+          type: string
+          default: USD
+        paymentMethodId:
+          type: string
+          description: Tokenised payment method reference (never a PAN)
+        idempotencyKey:
+          type: string
+          description: Supplied by the caller to make retries safe
+    RefundRequest:
+      type: object
+      properties:
+        amountCents:
+          type: integer
+          description: Omit for a full refund
+        reason:
+          type: string
+          enum: [requested_by_customer, duplicate, fraudulent]
+    Charge:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          $ref: '#/components/schemas/ChargeStatus'
+        amountCents:
+          type: integer
+        currency:
+          type: string
+        stripePaymentIntentId:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    Refund:
+      type: object
+      properties:
+        id:
+          type: string
+        chargeId:
+          type: string
+        amountCents:
+          type: integer
+        stripeRefundId:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
